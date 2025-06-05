@@ -52,3 +52,28 @@ vpn [uat|local|prod]
 The argument should match your config filename (e.g., `uat.ovpn` → `vpn uat`).
 
 Ensure your .env file includes `USERNAME_UAT` or `USERNAME_LOCAL` depending on your VPN target.
+
+
+
+## 🔐 Optional: Allow VPN to Connect Without Password Prompt
+To avoid being prompted for your macOS password each time the VPN connects, you can add a sudoers rule to allow openvpn to run without a password.
+
+### ⚠️ Use with caution:
+This gives permission to run openvpn as root without prompting for a password. Only use on a trusted machine.
+
+### ➕ Add to sudoers:
+1. Run:
+```
+sudo visudo
+```
+2. Add the following line at the bottom (replace `izorwebid` with your macOS username if different):
+```
+izorwebid ALL=(ALL) NOPASSWD: /usr/local/sbin/openvpn
+```
+
+3. Save and exit.
+This assumes openvpn is installed at `/usr/local/sbin/openvpn`. You can confirm with:
+```
+which openvpn
+```
+
