@@ -1,0 +1,159 @@
+#!/bin/bash
+
+# === CONFIG ===
+VPN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CONFIG_DIR="$VPN_DIR/configs"
+ICON_PATH="$VPN_DIR/assets/vpn.icns"
+ENV="$1"
+ENV_UPPER=$(echo "$ENV" | tr '[:lower:]' '[:upper:]')
+LOG_FILE=""
+RETRY_LIMIT=3
+OPENVPN_PID=""
+RECONNECT_COUNT=0
+EXITING=false
+
+# === Setup log file name berdasarkan tanggal sekarang ===
+setup_log_file() {
+  # Nama file log untuk hari ini
+  local today_log="$VPN_DIR/vpn-$(date +%Y%m%d).log"
+  
+  # Jika file log hari ini belum ada, hapus semua log lama (*.log)
+  if [[ ! -f "$today_log" ]]; then
+    echo "[$(date +%T)] Removing old log files..." | tee -a "$VPN_DIR/cleanup.log"
+    rm -f "$VPN_DIR"/vpn-*.log
+  fi
+
+  LOG_FILE="$today_log"
+}
+
+# === Notifikasi (visual, bell, dan flash) ===
+notify() {
+  local title="$1"
+  local msg="$2"
+  terminal-notifier -title "$title" -message "$msg" -appIcon "$ICON_PATH"
+  echo -e "\033[?5h"; sleep 0.2; echo -e "\033[?5l"
+  echo -ne "\007"
+}
+
+# === Cleanup saat Ctrl+C ===
+cleanup() {
+  EXITING=true
+  notify "VPN" "Disconnected manually"
+  echo -e "[VPN] Disconnected manually\n" | tee -a "$LOG_FILE"
+  if [[ -n "$OPENVPN_PID" ]]; then
+    sudo kill "$OPENVPN_PID" 2>/dev/null
+  else
+    sudo pkill -f "openvpn --config" 2>/dev/null
+  fi
+  exit 0
+}
+trap cleanup SIGINT
+
+# === Load credentials dari .env ===
+load_env() {
+  USERNAME=$(grep "^USERNAME_${ENV_UPPER}=" "$VPN_DIR/.env" | cut -d '=' -f2-)
+  PASSWORD=$(grep "^PASSWORD_${ENV_UPPER}=" "$VPN_DIR/.env" | cut -d '=' -f2-)
+  SECRET=$(grep "^SECRET_${ENV_UPPER}=" "$VPN_DIR/.env" | cut -d '=' -f2-)
+
+  if [[ -z "$USERNAME" || -z "$PASSWORD" || -z "$SECRET" ]]; then
+    echo "[VPN] Missing credentials for environment: $ENV"
+    exit 1
+  fi
+}
+
+# === Generate OTP dan simpan auth ke file sementara ===
+generate_auth_file() {
+  if ! command -v oathtool &>/dev/null; then
+    echo "[VPN] Missing 'oathtool'. Install with: brew install oath-toolkit"
+    exit 1
+  fi
+  OTP=$(oathtool --totp -b "$SECRET")
+  FINAL_PASS="${PASSWORD}${OTP}"
+  AUTH_FILE=$(mktemp)
+  echo -e "$USERNAME\n$FINAL_PASS" > "$AUTH_FILE"
+  chmod 600 "$AUTH_FILE"
+  echo "$AUTH_FILE"
+}
+
+# === Connect VPN ===
+connect_vpn() {
+  setup_log_file
+  notify "VPN" "Connecting to $ENV..."
+  echo -e "\n[$(date +%T)] Connecting to $ENV..." | tee -a "$LOG_FILE"
+
+  AUTH_FILE=$(generate_auth_file)
+
+  sudo openvpn --config "$CONFIG_DIR/$ENV.ovpn" \
+    --auth-user-pass "$AUTH_FILE" \
+    --log /dev/stdout 2>&1 | tee -a "$LOG_FILE" &
+
+  OPENVPN_PID=$!
+  (sleep 10 && rm -f "$AUTH_FILE") &
+
+  sleep 5
+
+  if ifconfig | grep -q tun; then
+    notify "VPN" "Connected to $ENV"
+    echo "[$(date +%T)] VPN connected to $ENV" | tee -a "$LOG_FILE"
+    return 0
+  else
+    notify "VPN" "Connection failed"
+    echo "[$(date +%T)] VPN failed to connect" | tee -a "$LOG_FILE"
+    return 1
+  fi
+}
+
+# === Monitor VPN dan reconnect maksimal RETRY_LIMIT kali ===
+monitor_vpn() {
+  while ! $EXITING; do
+    sleep 5
+    setup_log_file
+
+    # Cek apakah log file hari ini sudah berbeda, berarti ganti hari
+    if [[ "$LOG_FILE" != "$VPN_DIR/vpn-$(date +%Y%m%d).log" ]]; then
+      setup_log_file
+      echo "[$(date +%T)] Log file rotated to $LOG_FILE" | tee -a "$LOG_FILE"
+    fi
+
+    if ! ps -p "$OPENVPN_PID" > /dev/null 2>&1; then
+      echo "[$(date +%T)] VPN process died" | tee -a "$LOG_FILE"
+
+      if (( RECONNECT_COUNT < RETRY_LIMIT )); then
+        ((RECONNECT_COUNT++))
+        notify "VPN" "Connection lost, reconnect attempt $RECONNECT_COUNT/$RETRY_LIMIT"
+        echo "[$(date +%T)] Reconnect attempt $RECONNECT_COUNT/$RETRY_LIMIT" | tee -a "$LOG_FILE"
+        connect_vpn || continue
+      else
+        notify "VPN" "Failed after $RETRY_LIMIT retries, exiting."
+        echo "[$(date +%T)] VPN failed after $RETRY_LIMIT retries." | tee -a "$LOG_FILE"
+        exit 1
+      fi
+    fi
+  done
+}
+
+# === MAIN ===
+if [[ -z "$ENV" ]]; then
+  echo "Usage: vpn [uat|prod]"
+  exit 1
+fi
+
+load_env
+
+for attempt in $(seq 1 $RETRY_LIMIT); do
+  connect_vpn && break
+  echo "[$(date +%T)] Retry $attempt/$RETRY_LIMIT failed." | tee -a "$LOG_FILE"
+  notify "VPN" "Retry $attempt/$RETRY_LIMIT failed"
+
+  if [[ "$attempt" -eq "$RETRY_LIMIT" ]]; then
+    notify "VPN" "Failed after $RETRY_LIMIT retries."
+    echo "[$(date +%T)] VPN failed after $RETRY_LIMIT retries." | tee -a "$LOG_FILE"
+    exit 1
+  fi
+
+  sleep 3
+done
+
+echo "Press Ctrl+C to disconnect VPN..."
+
+monitor_vpn
