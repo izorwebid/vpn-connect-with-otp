@@ -11,6 +11,13 @@ RETRY_LIMIT=3
 OPENVPN_PID=""
 RECONNECT_COUNT=0
 EXITING=false
+LAST_IP_FILE="$VPN_DIR/last_ip.txt"
+
+# === Ambil IP Public ===
+get_public_ip() {
+  curl -s ifconfig.me || echo "0.0.0.0"
+}
+
 
 # === Setup log file name berdasarkan tanggal sekarang ===
 setup_log_file() {
@@ -63,17 +70,45 @@ load_env() {
 
 # === Generate OTP dan simpan auth ke file sementara ===
 generate_auth_file() {
-  if ! command -v oathtool &>/dev/null; then
-    echo "[VPN] Missing 'oathtool'. Install with: brew install oath-toolkit"
-    exit 1
+  local current_ip=$(get_public_ip)
+  local last_ip=""
+  local last_time=0
+  local now=$(date +%s)
+  local max_age=$((10 * 60 * 60)) # 10 jam
+
+  if [[ -f "$LAST_IP_FILE" ]]; then
+    read last_time last_ip < "$LAST_IP_FILE"
   fi
-  OTP=$(oathtool --totp -b "$SECRET")
-  FINAL_PASS="${PASSWORD}${OTP}"
-  AUTH_FILE=$(mktemp)
-  echo -e "$USERNAME\n$FINAL_PASS" > "$AUTH_FILE"
-  chmod 600 "$AUTH_FILE"
-  echo "$AUTH_FILE"
+
+  local expired=false
+  if (( now - last_time > max_age )); then
+    expired=true
+  fi
+
+  if [[ "$current_ip" == "$last_ip" && $expired == false ]]; then
+    echo "[$(date +%T)] Same IP detected ($current_ip), still valid (< 10h), using PASSWORD only" | tee -a "$LOG_FILE" >&2
+    FINAL_PASS="$PASSWORD"
+  else
+    echo "[$(date +%T)] New/expired IP detected ($current_ip), generating OTP" | tee -a "$LOG_FILE" >&2
+    if ! command -v oathtool &>/dev/null; then
+      echo "[VPN] Missing 'oathtool'. Install with: brew install oath-toolkit" >&2
+      exit 1
+    fi
+    OTP=$(oathtool --totp -b "$SECRET")
+    FINAL_PASS="${PASSWORD}${OTP}"
+    echo "$now $current_ip" > "$LAST_IP_FILE"
+  fi
+
+  local auth_file
+  auth_file=$(mktemp)
+  echo -e "$USERNAME\n$FINAL_PASS" > "$auth_file"
+  chmod 600 "$auth_file"
+
+  # Return murni path tanpa log
+  echo "$auth_file"
 }
+
+
 
 # === Connect VPN ===
 connect_vpn() {
