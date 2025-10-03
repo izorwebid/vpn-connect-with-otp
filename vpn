@@ -68,25 +68,49 @@ load_env() {
   fi
 }
 
-# === Generate OTP dan simpan auth ke file sementara ===
-generate_auth_file() {
-  local current_ip=$(get_public_ip)
-  local last_ip=""
-  local last_time=0
-  local now=$(date +%s)
-  local max_age=$((10 * 60 * 60)) # 10 jam
-
-  if [[ -f "$LAST_IP_FILE" ]]; then
-    read last_time last_ip < "$LAST_IP_FILE"
+# === Ambil last_ip dari file untuk config tertentu ===
+read_last_ip() {
+  local cfg="$1"
+  if [[ ! -f "$LAST_IP_FILE" ]]; then
+    echo "0 0"
+    return
   fi
+  local line
+  line=$(grep "^$cfg " "$LAST_IP_FILE")
+  if [[ -z "$line" ]]; then
+    echo "0 0"
+  else
+    # Format: ENV TIMESTAMP IP
+    echo "$line" | awk '{print $2, $3}'
+  fi
+}
 
-  local expired=false
-  if (( now - last_time > max_age )); then
+# === Update last_ip untuk config tertentu ===
+update_last_ip() {
+  local cfg="$1"
+  local ts="$2"
+  local ip="$3"
+  if grep -q "^$cfg " "$LAST_IP_FILE" 2>/dev/null; then
+    sed -i.bak "s|^$cfg .*|$cfg $ts $ip|" "$LAST_IP_FILE"
+  else
+    echo "$cfg $ts $ip" >> "$LAST_IP_FILE"
+  fi
+}
+
+# === Generate OTP dan simpan auth file sementara ===
+generate_auth_file() {
+  local current_ip
+  current_ip=$(get_public_ip)
+  local last_ip last_time now expired
+  read last_time last_ip < <(read_last_ip "$ENV")
+  now=$(date +%s)
+  expired=false
+  if (( now - last_time > 10*60*60 )); then
     expired=true
   fi
 
   if [[ "$current_ip" == "$last_ip" && $expired == false ]]; then
-    echo "[$(date +%T)] Same IP detected ($current_ip), still valid (< 10h), using PASSWORD only" | tee -a "$LOG_FILE" >&2
+    echo "[$(date +%T)] Same IP detected ($current_ip), still valid (<10h), using PASSWORD only" | tee -a "$LOG_FILE" >&2
     FINAL_PASS="$PASSWORD"
   else
     echo "[$(date +%T)] New/expired IP detected ($current_ip), generating OTP" | tee -a "$LOG_FILE" >&2
@@ -96,26 +120,21 @@ generate_auth_file() {
     fi
     OTP=$(oathtool --totp -b "$SECRET")
     FINAL_PASS="${PASSWORD}${OTP}"
-    echo "$now $current_ip" > "$LAST_IP_FILE"
+    update_last_ip "$ENV" "$now" "$current_ip"
   fi
 
   local auth_file
   auth_file=$(mktemp)
   echo -e "$USERNAME\n$FINAL_PASS" > "$auth_file"
   chmod 600 "$auth_file"
-
-  # Return murni path tanpa log
   echo "$auth_file"
 }
-
-
 
 # === Connect VPN ===
 connect_vpn() {
   setup_log_file
   notify "VPN" "Connecting to $ENV..."
-  echo -e "\n[$(date +%T)] Connecting to $ENV..." | tee -a "$LOG_FILE"
-
+  echo "[$(date +%T)] Connecting to $ENV..." | tee -a "$LOG_FILE"
   AUTH_FILE=$(generate_auth_file)
 
   sudo openvpn --config "$CONFIG_DIR/$ENV.ovpn" \
@@ -126,7 +145,6 @@ connect_vpn() {
   (sleep 10 && rm -f "$AUTH_FILE") &
 
   sleep 5
-
   if ifconfig | grep -q tun; then
     notify "VPN" "Connected to $ENV"
     echo "[$(date +%T)] VPN connected to $ENV" | tee -a "$LOG_FILE"
@@ -138,13 +156,11 @@ connect_vpn() {
   fi
 }
 
-# === Monitor VPN dan reconnect maksimal RETRY_LIMIT kali ===
+# === Monitor VPN ===
 monitor_vpn() {
   while ! $EXITING; do
     sleep 5
     setup_log_file
-
-    # Cek apakah log file hari ini sudah berbeda, berarti ganti hari
     if [[ "$LOG_FILE" != "$VPN_DIR/vpn-$(date +%Y%m%d).log" ]]; then
       setup_log_file
       echo "[$(date +%T)] Log file rotated to $LOG_FILE" | tee -a "$LOG_FILE"
@@ -152,7 +168,6 @@ monitor_vpn() {
 
     if ! ps -p "$OPENVPN_PID" > /dev/null 2>&1; then
       echo "[$(date +%T)] VPN process died" | tee -a "$LOG_FILE"
-
       if (( RECONNECT_COUNT < RETRY_LIMIT )); then
         ((RECONNECT_COUNT++))
         notify "VPN" "Connection lost, reconnect attempt $RECONNECT_COUNT/$RETRY_LIMIT"
@@ -179,16 +194,13 @@ for attempt in $(seq 1 $RETRY_LIMIT); do
   connect_vpn && break
   echo "[$(date +%T)] Retry $attempt/$RETRY_LIMIT failed." | tee -a "$LOG_FILE"
   notify "VPN" "Retry $attempt/$RETRY_LIMIT failed"
-
   if [[ "$attempt" -eq "$RETRY_LIMIT" ]]; then
     notify "VPN" "Failed after $RETRY_LIMIT retries."
     echo "[$(date +%T)] VPN failed after $RETRY_LIMIT retries." | tee -a "$LOG_FILE"
     exit 1
   fi
-
   sleep 3
 done
 
 echo "Press Ctrl+C to disconnect VPN..."
-
 monitor_vpn
